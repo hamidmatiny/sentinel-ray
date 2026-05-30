@@ -144,8 +144,8 @@ class DataStreamer:
             config.FRAMES_PER_BATCH,
         )
 
-        brightness = np.clip(brightness, 0.0, 1.0)
-        blur = np.clip(blur, 0.0, 1.0)
+        brightness = np.clip(brightness, 0.0, config.BRIGHTNESS_MAX_VALID)
+        blur = np.clip(blur, config.BLUR_MIN_VALID, None)
 
         return pd.DataFrame(
             {
