@@ -1,6 +1,6 @@
 # Sentinel Ray — Automated Data Drift & QA Gatekeeper
 
-Distributed camera telemetry ingestion with Ray Core and a Pandera-based QA validation gate.
+Distributed camera telemetry ingestion with Ray Core, Pandera QA validation, statistical drift detection, and automated incident orchestration.
 
 ## Phases
 
@@ -8,108 +8,123 @@ Distributed camera telemetry ingestion with Ray Core and a Pandera-based QA vali
 |-------|--------|-------------|
 | 1 | Complete | Ray `DataStreamer` actor simulating 3 concurrent camera feeds |
 | 2 | Complete | Distributed `QAValidationWorker` cluster with schema checks and quarantine routing |
-| 3 | Planned | Drift detection and automated gate enforcement |
+| 3 | Complete | Stateful `DriftAnalyzer` with KS tests and embedding distance metrics |
+| 4 | Complete | `PipelineOrchestrator` circuit breaker, alerting, and retraining triggers |
+
+See [PHASE_REPORT.md](PHASE_REPORT.md) for the full engineering log.
 
 ## What the Pipeline Does
 
 1. Initializes a local Ray cluster
 2. Streams mock batches from `camera_1`, `camera_2`, and `camera_3`
-3. Routes every batch through `QAValidationWorker` actors **before** any downstream processing
-4. Validates schema rules with Pandera:
-   - `brightness_avg` ∈ [10.0, 255.0]
-   - `blur_metric` ≥ 0
-   - `camera_id` matches `^camera_\d+$`
-   - `embedding` is a 128-dimensional NumPy vector
-5. Quarantines failed rows to `data/quarantine/` with JSON failure metadata
-6. Logs structured QA alerts and passes only valid rows to telemetry output
-
-From **batch round 6 onward**, `camera_2` simulates hardware failure (brightness collapse + embedding drift). QA catches sub-threshold brightness and quarantines those rows.
+3. Routes every batch through `QAValidationWorker` actors before downstream processing
+4. Sends QA-validated rows to `DriftAnalyzer` for sliding-window statistical drift checks
+5. Feeds QA and drift metrics into `PipelineOrchestrator` for circuit breaker evaluation
+6. Quarantines schema failures to `data/quarantine/`
+7. Writes incident alerts to `alerts/` and queues simulated retraining webhook POSTs on trip
 
 ## Project Layout
 
 ```
 sentinel-ray/
-├── config.py              # Paths, stream sizes, QA thresholds
+├── config.py              # Paths, stream sizes, QA, drift, and orchestration thresholds
 ├── ingestion_engine.py    # Ray DataStreamer actor
 ├── qa_validator.py        # Pandera schema, QAValidationWorker, quarantine logic
-├── main.py                # Entry point (stream → QA → telemetry)
+├── drift_detector.py      # Golden baseline, DriftAnalyzer, KS + embedding drift
+├── orchestrator.py        # PipelineOrchestrator, circuit breaker, alerting, retraining
+├── main.py                # Entry point (stream → QA → drift → orchestration)
+├── Dockerfile             # Production container image (non-root)
+├── docker-compose.yml     # Local deployment with volume mounts and resource limits
+├── PHASE_REPORT.md        # Phase-by-phase engineering log
 ├── requirements.txt
 ├── tests/
 │   ├── conftest.py
-│   └── test_qa_validator.py
+│   ├── test_qa_validator.py
+│   ├── test_drift_detector.py
+│   └── test_orchestrator.py
 └── README.md
 ```
 
-## Prerequisites
-
-- Python 3.10+
-- macOS, Linux, or WSL recommended for local Ray execution
-
-## Setup
+## Local Setup (without Docker)
 
 ```bash
 cd sentinel-ray
 python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-## Run the Pipeline
-
-```bash
 python3 main.py
-```
-
-Expected output includes QA result lines:
-
-```
-QA RESULT | batch_round=6 | camera=camera_2 | status=failed | valid=0 | quarantined=4
-QA ALERT | camera=camera_2 | batch_round=6 | quarantined_rows=4
-QA RULE FAILURE | ... | column=brightness_avg | check=in_range(10.0, 255.0) | ...
-```
-
-Quarantined rows are written to:
-
-```
-data/quarantine/
-├── camera_2_round006_camera_2_b006_f00_<timestamp>.json
-└── camera_2_round006_camera_2_b006_f00_<timestamp>_reason.json
-```
-
-## Run Tests
-
-```bash
 pytest tests/ -v
 ```
 
-The test suite covers:
+## Docker Deployment
 
-- Pandera schema acceptance of valid batches
-- Rejection of invalid brightness, blur, camera IDs, and embedding dimensions
-- Row-level split between valid and quarantined data
-- Quarantine file creation with failure metadata
+Build and run the full pipeline in a container:
 
-## Configuration
+```bash
+mkdir -p data/quarantine alerts logs
+docker compose up --build
+```
 
-Key settings in `config.py`:
+This will:
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `BRIGHTNESS_MIN_VALID` | `10.0` | Minimum allowed brightness |
-| `BRIGHTNESS_MAX_VALID` | `255.0` | Maximum allowed brightness |
-| `CAMERA_ID_PATTERN` | `^camera_\d+$` | Valid camera ID regex |
-| `QUARANTINE_DIR` | `data/quarantine/` | Failed row storage |
-| `QA_WORKER_POOL_SIZE` | `3` | Parallel QAValidationWorker actors |
-| `ANOMALY_START_BATCH` | `6` | First anomalous batch for `camera_2` |
+- Build the SentinelRay image from `Dockerfile` (Python 3.12, non-root `sentinel` user)
+- Mount host directories for quarantine data, alerts, and logs
+- Limit the container to 2 CPUs and 2 GB RAM
+- Expose port `8265` for the Ray dashboard
+
+Inspect outputs on the host after a run:
+
+```
+data/quarantine/   # QA-failed rows
+alerts/            # Incident JSON payloads + retraining trigger records
+logs/              # Application logs (when configured to file)
+```
+
+## Run Tests Inside the Container
+
+```bash
+docker compose build
+docker compose run --rm sentinel-ray pytest tests/ -v
+```
+
+Or against a running container:
+
+```bash
+docker compose exec sentinel-ray pytest tests/ -v
+```
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     Main[main.py] --> Stream[DataStreamer]
-    Stream --> Raw[Raw Batches]
-    Raw --> QA[QAValidationWorker Pool]
+    Stream --> QA[QAValidationWorker Pool]
     QA --> Valid[Valid Rows]
     QA --> Quarantine[data/quarantine/]
+    Valid --> Drift[DriftAnalyzer]
+    QA --> Orchestrator[PipelineOrchestrator]
+    Drift --> Orchestrator
+    Orchestrator --> Alerts[alerts/]
+    Orchestrator --> Retrain[Retraining Webhook]
     Valid --> Log[Telemetry Logging]
 ```
+
+## Key Orchestration Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `QA_QUARANTINE_RATE_THRESHOLD` | `0.15` | Rolling quarantine rate that trips the breaker |
+| `ORCHESTRATOR_QA_WINDOW_BATCHES` | `5` | Batch window for quarantine rate calculation |
+| `DRIFT_MIN_FEATURES_FOR_INCIDENT` | `2` | Drifted features required to trip breaker |
+| `RETRAINING_WEBHOOK_URL` | `http://localhost:8080/api/v1/retrain` | Simulated retraining endpoint |
+| `ALERTS_DIR` | `alerts/` | Incident alert JSON output directory |
+
+## Expected Incident Behavior
+
+From batch round 6 onward, `camera_2` exceeds the 15% quarantine threshold. The orchestrator:
+
+1. Trips the circuit breaker once for `camera_2`
+2. Writes a structured Slack/PagerDuty-style JSON alert to `alerts/`
+3. Queues an asynchronous retraining pipeline POST (saved locally if the webhook is unreachable)
+
+Final pipeline output includes explicit incident and webhook summaries.

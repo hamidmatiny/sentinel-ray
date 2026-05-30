@@ -1,0 +1,28 @@
+{
+  "request_id": "retrain_393f439c37c3",
+  "trigger_source": "sentinel-ray-orchestrator",
+  "triggered_at": "2026-05-30T13:09:25.161076+00:00",
+  "incident_id": "inc_camera_2_e0bd325ad283",
+  "camera_id": "camera_2",
+  "pipeline": "upstream-model-retrain",
+  "engine": "airflow",
+  "action": "trigger_dag",
+  "dag_id": "sentinel_ray_retrain_and_verify",
+  "inputs": {
+    "quarantine_dir": "/Users/hamidrezamatiny/Cursor/sentinel-ray/data/quarantine",
+    "alerts_dir": "/Users/hamidrezamatiny/Cursor/sentinel-ray/alerts",
+    "reasons": [
+      {
+        "type": "qa_quarantine_rate_exceeded",
+        "camera_id": "camera_2",
+        "observed_rate": 0.2,
+        "threshold": 0.15,
+        "message": "QA quarantine rate 20.00% exceeds 15.00% threshold."
+      }
+    ]
+  },
+  "metadata": {
+    "batch_round": 6,
+    "severity": "critical"
+  }
+}

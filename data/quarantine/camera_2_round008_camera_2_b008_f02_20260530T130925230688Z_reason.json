@@ -1,0 +1,14 @@
+{
+  "batch_round": 8,
+  "camera_id": "camera_2",
+  "frame_id": "camera_2_b008_f02",
+  "row_index": 2,
+  "failed_rules": [
+    {
+      "column": "brightness_avg",
+      "check": "_brightness_valid",
+      "failure_case": 3.0348790184712042
+    }
+  ],
+  "quarantined_at": "2026-05-30T13:09:25.230791+00:00"
+}

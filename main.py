@@ -1,4 +1,4 @@
-"""Entry point: ingestion stream routed through distributed QA validation."""
+"""Entry point: ingestion stream with QA validation, drift analysis, and orchestration."""
 
 from __future__ import annotations
 
@@ -8,13 +8,16 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import ray
 
 import config
+from drift_detector import create_drift_analyzer
 from ingestion_engine import (
     create_data_streamer,
     fetch_batches_concurrently,
     initialize_ray_cluster,
 )
+from orchestrator import create_pipeline_orchestrator
 from qa_validator import create_qa_worker_pool, validate_batches_concurrently
 
 
@@ -22,6 +25,7 @@ def configure_logging() -> None:
     """Configure structured console logging for the pipeline."""
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)
     config.QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
+    config.ALERTS_DIR.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -80,6 +84,83 @@ def log_qa_results(batch_index: int, qa_results: list[dict[str, Any]]) -> None:
             )
 
 
+def log_drift_report(report: dict[str, Any]) -> None:
+    """Emit drift analysis results, with high-visibility warnings on detection."""
+    logger = logging.getLogger(__name__)
+    camera_id = report.get("camera_id", "unknown")
+    status = report.get("status", "unknown")
+
+    if status == "buffering":
+        logger.info(
+            "DRIFT BUFFER | camera=%s | buffer_size=%d | required=%d",
+            camera_id,
+            report.get("buffer_size", 0),
+            report.get("window_size_required", config.DRIFT_WINDOW_SIZE),
+        )
+        return
+
+    if status == "skipped":
+        logger.debug(
+            "DRIFT SKIPPED | camera=%s | reason=%s",
+            camera_id,
+            report.get("reason", "unknown"),
+        )
+        return
+
+    if status != "analyzed":
+        return
+
+    logger.info(
+        "DRIFT REPORT | camera=%s | window_size=%d | drift_detected=%s",
+        camera_id,
+        report.get("window_size", 0),
+        report.get("drift_detected", False),
+    )
+
+    if not report.get("drift_detected"):
+        return
+
+    for feature, metrics in report.get("features", {}).items():
+        if not metrics.get("drift_detected"):
+            continue
+
+        if "p_value" in metrics:
+            logger.warning(
+                "⚠️ STATISTICAL DRIFT DETECTED | camera=%s | feature=%s | p-value=%.6f",
+                camera_id,
+                feature,
+                metrics["p_value"],
+            )
+        else:
+            logger.warning(
+                (
+                    "⚠️ STATISTICAL DRIFT DETECTED | camera=%s | feature=%s | "
+                    "cosine_sim=%.4f | euclidean_dist=%.4f"
+                ),
+                camera_id,
+                feature,
+                metrics.get("mean_cosine_similarity", 0.0),
+                metrics.get("mean_euclidean_distance", 0.0),
+            )
+
+
+def log_orchestrator_incidents(batch_result: dict[str, Any]) -> None:
+    """Log incidents triggered by the orchestrator for a batch round."""
+    logger = logging.getLogger(__name__)
+    for incident in batch_result.get("incidents_triggered", []):
+        logger.critical(
+            (
+                "ORCHESTRATOR INCIDENT | batch_round=%d | camera=%s | "
+                "incident_id=%s | alert_path=%s | retraining_request_id=%s"
+            ),
+            incident.get("batch_round"),
+            incident.get("camera_id"),
+            incident.get("incident_id"),
+            incident.get("alert_path"),
+            incident.get("retraining", {}).get("request_id"),
+        )
+
+
 def log_batch_telemetry(
     batch_index: int,
     summaries: list[dict[str, Any]],
@@ -116,8 +197,105 @@ def log_batch_telemetry(
         logger.debug("frame_ids=%s", summary["frame_ids"])
 
 
+def submit_drift_analysis(
+    drift_analyzer: ray.actor.ActorHandle,
+    qa_results: list[dict[str, Any]],
+) -> list[tuple[str, ray.ObjectRef]]:
+    """Fire non-blocking drift analysis tasks for QA-validated camera batches."""
+    futures: list[tuple[str, ray.ObjectRef]] = []
+    for result in qa_results:
+        valid_df = result["valid_df"]
+        camera_id = result["camera_id"]
+        future = drift_analyzer.accumulate_and_analyze.remote(camera_id, valid_df)
+        futures.append((camera_id, future))
+    return futures
+
+
+def collect_drift_reports(
+    drift_futures: list[tuple[str, ray.ObjectRef]],
+) -> list[dict[str, Any]]:
+    """Resolve drift analysis futures and log any detected drift."""
+    reports: list[dict[str, Any]] = []
+    for camera_id, future in drift_futures:
+        try:
+            report = ray.get(future)
+            reports.append(report)
+            log_drift_report(report)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Drift analysis failed for camera=%s.",
+                camera_id,
+            )
+    return reports
+
+
+def serialize_qa_results_for_orchestrator(
+    qa_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Strip DataFrames from QA results before sending metrics to the orchestrator."""
+    serialized: list[dict[str, Any]] = []
+    for result in qa_results:
+        serialized.append(
+            {
+                "camera_id": result.get("camera_id"),
+                "status": result.get("status"),
+                "valid_count": result.get("valid_count", 0),
+                "quarantined_count": result.get("quarantined_count", 0),
+                "error_message": result.get("error_message"),
+            }
+        )
+    return serialized
+
+
+def log_pipeline_summary(
+    total_quarantined: int,
+    drift_alerts: int,
+    incident_summary: dict[str, Any],
+) -> None:
+    """Emit final pipeline statistics including orchestrator incidents."""
+    logger = logging.getLogger(__name__)
+    logger.info(
+        (
+            "Ingestion pipeline completed. total_quarantined_rows=%d | "
+            "drift_alert_count=%d | total_incidents=%d"
+        ),
+        total_quarantined,
+        drift_alerts,
+        incident_summary.get("total_incidents", 0),
+    )
+
+    tripped_cameras = incident_summary.get("tripped_cameras", [])
+    if tripped_cameras:
+        logger.critical(
+            "CIRCUIT BREAKER SUMMARY | tripped_cameras=%s",
+            ", ".join(tripped_cameras),
+        )
+
+    for incident in incident_summary.get("incidents", []):
+        logger.critical(
+            (
+                "INCIDENT SUMMARY | camera=%s | incident_id=%s | "
+                "alert_path=%s | reasons=%d"
+            ),
+            incident.get("camera_id"),
+            incident.get("incident_id"),
+            incident.get("alert_path"),
+            len(incident.get("reasons", [])),
+        )
+
+    for webhook in incident_summary.get("webhook_triggers", []):
+        logger.info(
+            (
+                "WEBHOOK SUMMARY | request_id=%s | status=%s | url=%s"
+            ),
+            webhook.get("request_id"),
+            webhook.get("status"),
+            webhook.get("webhook_url"),
+        )
+
+
 def run_ingestion_pipeline() -> None:
-    """Initialize Ray, validate batches via QA workers, then log telemetry."""
+    """Initialize Ray, validate batches, analyze drift, orchestrate incidents."""
     logger = logging.getLogger(__name__)
     streamer = None
 
@@ -125,14 +303,20 @@ def run_ingestion_pipeline() -> None:
         initialize_ray_cluster()
         streamer = create_data_streamer()
         qa_workers = create_qa_worker_pool()
+        drift_analyzer = create_drift_analyzer()
+        orchestrator = create_pipeline_orchestrator()
 
         logger.info(
-            "Starting ingestion with QA gate: %d batch rounds x %d cameras.",
+            (
+                "Starting SentinelRay pipeline: %d batch rounds x %d cameras "
+                "(QA + drift + orchestration)."
+            ),
             config.TOTAL_BATCHES,
             config.NUM_CAMERAS,
         )
 
         total_quarantined = 0
+        drift_alerts = 0
 
         for batch_index in range(1, config.TOTAL_BATCHES + 1):
             raw_batches = fetch_batches_concurrently(streamer)
@@ -141,6 +325,8 @@ def run_ingestion_pipeline() -> None:
                 raw_batches,
                 batch_round=batch_index,
             )
+
+            drift_futures = submit_drift_analysis(drift_analyzer, qa_results)
 
             valid_batches = [result["valid_df"] for result in qa_results]
             summaries = []
@@ -151,14 +337,25 @@ def run_ingestion_pipeline() -> None:
                 summaries.append(summary)
             log_batch_telemetry(batch_index, summaries, qa_results)
 
+            drift_reports = collect_drift_reports(drift_futures)
+            drift_alerts += sum(1 for report in drift_reports if report.get("drift_detected"))
+
+            orchestrator_input = serialize_qa_results_for_orchestrator(qa_results)
+            batch_incidents = ray.get(
+                orchestrator.process_batch_metrics.remote(
+                    batch_index,
+                    orchestrator_input,
+                    drift_reports,
+                )
+            )
+            log_orchestrator_incidents(batch_incidents)
+
             total_quarantined += sum(
                 result["quarantined_count"] for result in qa_results
             )
 
-        logger.info(
-            "Ingestion pipeline completed. total_quarantined_rows=%d",
-            total_quarantined,
-        )
+        incident_summary = ray.get(orchestrator.get_incident_summary.remote())
+        log_pipeline_summary(total_quarantined, drift_alerts, incident_summary)
 
     except Exception:
         logger.exception("Ingestion pipeline failed.")
