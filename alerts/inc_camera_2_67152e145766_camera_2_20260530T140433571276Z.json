@@ -1,0 +1,52 @@
+{
+  "incident_id": "inc_camera_2_67152e145766",
+  "severity": "critical",
+  "status": "open",
+  "timestamp": "2026-05-30T14:04:33.571227+00:00",
+  "batch_round": 6,
+  "camera_id": "camera_2",
+  "circuit_breaker_tripped": true,
+  "summary": "Circuit breaker tripped for camera_2: QA quarantine rate 20.00% exceeds 15.00% threshold.",
+  "reasons": [
+    {
+      "type": "qa_quarantine_rate_exceeded",
+      "camera_id": "camera_2",
+      "observed_rate": 0.2,
+      "threshold": 0.15,
+      "message": "QA quarantine rate 20.00% exceeds 15.00% threshold."
+    }
+  ],
+  "metrics": {
+    "rolling_quarantine_rate": 0.2,
+    "qa_window_batches": 5
+  },
+  "drift_report": null,
+  "notification_channels": {
+    "slack": {
+      "channel": "#sentinel-ray-alerts",
+      "text": ":rotating_light: *SentinelRay Incident* | camera `camera_2` | batch 6 | quarantine_rate=20.00%"
+    },
+    "pagerduty": {
+      "routing_key": "sentinel-ray-production",
+      "event_action": "trigger",
+      "payload": {
+        "summary": "SentinelRay circuit breaker tripped for camera_2",
+        "severity": "critical",
+        "source": "sentinel-ray-orchestrator",
+        "custom_details": {
+          "camera_id": "camera_2",
+          "batch_round": 6,
+          "reasons": [
+            {
+              "type": "qa_quarantine_rate_exceeded",
+              "camera_id": "camera_2",
+              "observed_rate": 0.2,
+              "threshold": 0.15,
+              "message": "QA quarantine rate 20.00% exceeds 15.00% threshold."
+            }
+          ]
+        }
+      }
+    }
+  }
+}
